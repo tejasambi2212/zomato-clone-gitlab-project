@@ -1,0 +1,195 @@
+stages:
+  - install
+  - test
+  - security 
+  - containerize
+  - deploy-stage
+  - stage-health-check
+  - deploy-production
+  - verify-production
+  - production-health-check
+  - rollback-production
+
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - .npm
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+#pipeline starts from here
+
+#install dependencies
+install_dependencies:
+  stage: install
+  image: node:18.16.0
+  script:
+    - npm ci --cache .npm --prefer-offline
+
+#test application
+test_application:
+  stage: test
+  image: node:18.16.0
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm test -- --coverage --watchAll=false --passWithNoTests
+  artifacts: 
+      paths:
+        - coverage
+
+#security stage SAST and secret detection
+.sast:
+  stage: security
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+    when: always
+
+.secret_detection:
+  stage: security
+  artifacts:
+    reports:
+      secret_detection: gl-secret-detection-report.json
+    when: always
+
+#containerize application
+containerize_application:
+  stage: containerize
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  script:
+    - echo "Dockerizing the application..."
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+    - docker images 
+
+  rules:
+   - if: '$CI_COMMIT_TAG'
+     when: on_success
+   - when: never
+
+
+deploy-stage:
+  stage: deploy-stage
+  image: 
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+
+  variables:
+    KUBECONFIG: $KUBECONFIG_DATA
+
+  script:
+    - echo "Deploying to stage environment..."
+    - echo "KUBECONFIG=$KUBECONFIG"
+    - test -f "$KUBECONFIG" && echo "Kubeconfig file exists" || echo "Kubeconfig file NOT found"
+    - kubectl get nodes
+
+    - sed -i "s|IMAGE_TAG|$CI_COMMIT_TAG|g" ./Kubernetes/stage_deployment.yaml
+    - kubectl apply -f Kubernetes/stage_deployment.yaml
+
+stage_health_check:
+  stage: stage-health-check
+  image: curlimages/curl:latest
+
+  script:
+    - echo "Performing health check for stage environment..."
+    - sleep 100
+    - |
+      status=$(curl --silent \
+        --output /dev/null \
+        --write-out "%{http_code}" \
+        -H "Host: stage.zomatoapp.com" \
+        http://13.207.190.3/)
+
+      echo "HTTP Status: $status"
+
+      if [ "$status" -ne 200 ]; then
+        echo "Stage health check failed"
+        exit 1
+      fi
+
+      echo "Stage health check passed"
+
+#####################################################################
+#production deployment and health check stages
+deploy-production:
+  when: manual
+  stage: deploy-production
+  image: 
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+
+  variables:
+    KUBECONFIG: $KUBECONFIG_DATA
+
+  script:
+    - echo "Deploying to production environment..."
+    - kubectl get nodes
+
+    - sed -i "s|IMAGE_TAG|$CI_COMMIT_TAG|g" ./Kubernetes/prod_deployment.yaml
+    - kubectl apply -f Kubernetes/prod_deployment.yaml
+
+
+###verify production deployment stage
+verify-production:
+  stage: verify-production
+  allow_failure: true
+  image: 
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+
+  variables:
+    KUBECONFIG: $KUBECONFIG_DATA
+  script:
+    - echo "Verifying production deployment..."
+    - kubectl get pods
+    - kubectl rollout status deployment/prod-deployment -n prod --timeout=300s
+
+###### production health check stage  
+production_health_check:
+  stage: production-health-check
+  allow_failure: true
+  image: curlimages/curl:latest
+
+  script:
+    - echo "Performing health check for production environment..."
+    - sleep 100
+    - |
+      status=$(curl --silent \
+        --output /dev/null \
+        --write-out "%{http_code}" \
+        -H "Host: www.zomatoapp.com" \
+        http://13.207.190.3/)
+
+      echo "HTTP Status: $status"
+
+      if [ "$status" -ne 200 ]; then
+        echo "Production health check failed"
+        exit 1
+      fi
+
+      echo "Production health check passed"
+
+###rollback stage for production environment
+  
+rollback-production:
+  stage: rollback-production
+  when: manual
+  image: 
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+
+  variables:
+    KUBECONFIG: $KUBECONFIG_DATA
+
+  script:
+    - echo "Rolling back to previous version in production environment..."
+    - kubectl get pods
+    - kubectl rollout undo deployment/prod-deployment -n prod
+    - kubectl rollout status deployment/prod-deployment -n prod --timeout=300s
